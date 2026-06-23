@@ -83,6 +83,9 @@ struct sqlite3_stmt {
     int nslots;
     char *sql;               // malloc'd copy of the prepared SQL (for expanded_sql)
     struct sqlite3 *db;      // owning connection, for changes bookkeeping
+    // Cached parameter names (1-based). DuckDB returns them without the '$' prefix,
+    // but SQLite's contract (and Bun's lookup) expects the prefix, so we prepend it.
+    char **param_names;
 };
 
 // ---- helpers ----
@@ -483,18 +486,17 @@ int sqlite3_column_type(struct sqlite3_stmt *s, int i)
     case DUCKDB_TYPE_USMALLINT:
     case DUCKDB_TYPE_UINTEGER:
     case DUCKDB_TYPE_UBIGINT:
-    case DUCKDB_TYPE_HUGEINT:
-    case DUCKDB_TYPE_UHUGEINT:
         return SQLITE_INTEGER;
     case DUCKDB_TYPE_FLOAT:
     case DUCKDB_TYPE_DOUBLE:
-    case DUCKDB_TYPE_DECIMAL:
         return SQLITE_FLOAT;
     case DUCKDB_TYPE_BLOB:
         return SQLITE_BLOB;
     default:
-        // Everything else (VARCHAR, timestamps, dates, lists, structs, uuid, ...) is
-        // fetched as text via duckdb_value_string, which auto-casts.
+        // Everything else is fetched as text via duckdb_value_string, which auto-casts.
+        // This includes VARCHAR, timestamps, DECIMAL, HUGEINT, LIST, STRUCT, UUID, etc.
+        // Routing HUGEINT/DECIMAL/LIST/STRUCT through TEXT prevents silent truncation
+        // (HUGEINT overflows int64; complex types return empty if not stringified).
         return SQLITE_TEXT;
     }
 }
