@@ -1,0 +1,11 @@
+{
+  "name": "duckdb-bun-sqlite-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Use DuckDB as the engine behind Bun's native bun:sqlite / Bun.SQL via a SQLite-ABI shim.",
+  "license": "MIT",
+  "scripts": {
+    "build": "scripts/build.sh",
+    "test": "bun test/sql-tagged.ts"
+  }
+}

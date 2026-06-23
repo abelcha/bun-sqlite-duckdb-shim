@@ -1,0 +1,25 @@
+# fetched/built by scripts/build.sh — never commit
+vendor/
+*.dylib
+*.so
+*.dll
+libduckdb*.zip
+libduckdb/
+
+# the full duckdb source clone (only headers are needed, fetched via build.sh)
+duckdb/
+
+# libduckdb prebuilt extraction working dir
+libduckdb/
+
+# build artifacts / probes
+*.o
+probe
+probe.c
+
+# node/bun
+node_modules/
+bun.lockb
+
+# os cruft
+.DS_Store
