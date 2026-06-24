@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun-shim",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Use DuckDB as the engine behind Bun's native bun:sqlite / Bun.SQL via a static SQLite-ABI shim. require(\"duckdb-bun-shim\") returns the prebuilt dylib path.",
   "license": "MIT",
   "repository": {
@@ -13,13 +13,11 @@
     "index.cjs",
     "index.d.ts",
     "prebuilt/",
-    "scripts/postinstall.js",
     "README.md"
   ],
   "scripts": {
     "build:static": "bash scripts/build-static.sh",
     "test": "bun test/sql-tagged.ts",
-    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "node -e \"const f=require('node:fs'),p='darwin-arm64.dylib darwin-x64.dylib linux-x64.so linux-arm64.so'.split(' ');for(const b of p){if(!f.existsSync('prebuilt/'+b)){console.error('MISSING prebuilt/'+b+' — run CI build first');process.exit(1)}}console.log('core prebuilt binaries present')\""
   }
 }
