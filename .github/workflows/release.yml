@@ -13,6 +13,11 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# softprops/action-gh-release needs contents:write to create the release and
+# upload assets. (New repos default to read-only GITHUB_TOKEN.)
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.triple }}
@@ -98,21 +103,25 @@ jobs:
           done
           [ -f "prebuilt/win32-x64.dll" ] && echo "windows: present" || echo "windows: skipped (experimental)"
 
-      - name: Attach binaries to GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          # Glob uploads whatever was built (skips missing windows binary)
-          files: |
-            prebuilt/*
-
       - uses: oven-sh/setup-bun@v2
 
       - uses: actions/setup-node@v4
         with:
           registry-url: https://registry.npmjs.org
 
-      - name: Publish
+      # Publish runs first. It fails until NPM_TOKEN is configured — that's
+      # expected. `if: always()` on the release step below means the GitHub
+      # release assets still get attached regardless.
+      - name: Publish to npm
+        continue-on-error: true
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach binaries to GitHub release
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          # Glob uploads whatever was built (skips missing windows binary)
+          files: |
+            prebuilt/*
