@@ -24,22 +24,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14,         triple: darwin-arm64 }
-          - { runner: macos-13,         triple: darwin-x64 }
-          - { runner: ubuntu-24.04,     triple: linux-x64 }
+          # Both mac arches built on macos-14 (arm64). x64 is cross-compiled
+          # via `clang -arch x86_64` — avoids the deprecated macos-13 Intel
+          # runner, which queues indefinitely.
+          - { runner: macos-14,     triple: darwin-arm64 }
+          - { runner: macos-14,     triple: darwin-x64,   shim_triple: darwin-x64 }
+          - { runner: ubuntu-24.04, triple: linux-x64 }
           - { runner: ubuntu-24.04-arm, triple: linux-arm64 }
           # Windows static-libs ship as `static-libs-windows-mingw.zip`; needs
           # msys2/setup-msys2 + gcc — not wired yet.
-          - { runner: windows-2022,     triple: win32-x64, experimental: true }
+          - { runner: windows-2022, triple: win32-x64, experimental: true }
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
 
-      # The build script auto-detects (os, arch) from the runner.
+      # The build script auto-detects (os, arch) from the runner; SHIM_TRIPLE
+      # forces the output target (cross-compile).
       - name: Build (unix)
         if: runner.os != 'Windows'
+        env:
+          SHIM_TRIPLE: ${{ matrix.shim_triple }}
         run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
 
       - name: Build (windows)

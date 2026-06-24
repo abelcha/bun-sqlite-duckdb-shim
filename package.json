@@ -1,6 +1,6 @@
 {
   "name": "duckdb-bun-shim",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Use DuckDB as the engine behind Bun's native bun:sqlite / Bun.SQL via a static SQLite-ABI shim. require(\"duckdb-bun-shim\") returns the prebuilt dylib path.",
   "license": "MIT",
   "repository": {
