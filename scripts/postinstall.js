@@ -9,7 +9,7 @@
 const { existsSync, mkdirSync } = require("node:fs");
 const { join } = require("node:path");
 
-const VERSION = "v0.1.0";
+const VERSION = "v0.1.1";
 const REPO = "abelcha/bun-sqlite-duckdb-shim";
 
 const { platform, arch } = process;
