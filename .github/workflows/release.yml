@@ -1,0 +1,110 @@
+name: Release
+
+# Builds ONE self-contained, statically-linked binary per platform, collects
+# them into a single npm package, and publishes. Triggered by a git tag (v*).
+#
+# Result: `require("duckdb-bun-shim")` returns the path to the right prebuilt
+# binary for the current platform/arch. No libduckdb alongside, no rpath.
+#
+# Required secret: NPM_TOKEN  (npm access token with publish rights)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14,     triple: darwin-arm64 }
+          - { runner: macos-13,     triple: darwin-x64 }
+          - { runner: ubuntu-24.04, triple: linux-x64 }
+          - { runner: ubuntu-24.04-arm, triple: linux-arm64 }
+          # Windows static-libs ship as `static-libs-windows-mingw.zip`
+          - { runner: windows-2022, triple: win32-x64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      # The build script auto-detects (os, arch) from the runner.
+      # Windows needs mingw gcc; GH windows-2022 ships it via MSYS2.
+      - name: Build (unix)
+        if: runner.os != 'Windows'
+        run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
+
+      - name: Build (windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
+
+      - name: Smoke test (unix)
+        if: runner.os != 'Windows'
+        run: |
+          bun -e '
+          const { Database } = require("bun:sqlite");
+          const path = require("node:path");
+          const file = path.join(process.cwd(),
+            "prebuilt", `${process.platform}-${process.arch.replace("x64","x64")}.${process.platform==="darwin"?"dylib":process.platform==="win32"?"dll":"so"}`);
+          Database.setCustomSQLite(file);
+          const db = new Database(":memory:");
+          console.log("OK:", db.query("SELECT 1+1 AS s").get());
+          '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.triple }}
+          path: prebuilt/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-24.04
+    # Only publish on tagged releases
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect all prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilt-*
+          path: prebuilt
+          merge-multiple: true
+
+      - name: Verify all platforms present
+        run: |
+          ls -la prebuilt/
+          for f in darwin-arm64.dylib darwin-x64.dylib linux-x64.so linux-arm64.so win32-x64.dll; do
+            test -f "prebuilt/$f" || { echo "MISSING prebuilt/$f"; exit 1; }
+          done
+
+      - name: Attach binaries to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            prebuilt/darwin-arm64.dylib
+            prebuilt/darwin-x64.dylib
+            prebuilt/linux-x64.so
+            prebuilt/linux-arm64.so
+            prebuilt/win32-x64.dll
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

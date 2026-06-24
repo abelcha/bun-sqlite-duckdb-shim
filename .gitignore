@@ -19,7 +19,12 @@ probe.c
 
 # node/bun
 node_modules/
+bun.lock
 bun.lockb
+
+# prebuilt/ is produced by CI per-platform and shipped IN the npm package.
+# Don't commit the binaries; the release workflow rebuilds and collects them.
+prebuilt/
 
 # os cruft
 .DS_Store
