@@ -5,7 +5,8 @@
  * @example
  * ```ts
  * import { Database } from "bun:sqlite";
- * Database.setCustomSQLite(require("duckdb-bun-shim"));
+ * import shim from "duckdb-bun-shim";
+ * Database.setCustomSQLite(shim);
  * ```
  */
 declare const path: string;

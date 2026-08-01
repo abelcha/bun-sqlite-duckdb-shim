@@ -22,8 +22,9 @@ DuckDB's killer feature is querying files directly:
 ```ts
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
+import shim from "duckdb-bun-shim";
 
-Database.setCustomSQLite(require("duckdb-bun-shim"));
+Database.setCustomSQLite(shim);
 
 const sql = new SQL(":memory:");
 const rows = await sql`SELECT * FROM read_csv('people.csv') WHERE id = ${2}`;
@@ -37,20 +38,21 @@ API, no extra dependencies.
 ## Quick start
 
 ```sh
-bun add duckdb-bun-shim
+bun add abelcha/bun-sqlite-duckdb-shim
 ```
 
 No postinstall, no `trustedDependencies`, no build step — the shim and DuckDB are a
-single statically-linked binary shipped in the package.
+single statically-linked binary (~46 MB, `darwin-arm64` / `darwin-x64` / `linux-x64` /
+`linux-arm64`).
 
 ## Usage
 
 ```ts
 import { Database } from "bun:sqlite";
+import shim from "duckdb-bun-shim"; // absolute path to the binary for this platform/arch
 
 // MUST run before any Database is opened.
-// require() returns the absolute path to the binary for this platform/arch.
-Database.setCustomSQLite(require("duckdb-bun-shim"));
+Database.setCustomSQLite(shim);
 
 // Synchronous (bun:sqlite)
 const db = new Database(":memory:");
@@ -63,11 +65,12 @@ const sql = new SQL(":memory:");
 await sql`SELECT * FROM read_csv('data.csv') WHERE id = ${2}`;
 ```
 
-If you install straight from git instead of npm the binary isn't committed, so the first
-`require()` fetches it from the matching GitHub release (synchronously, via `curl`) and
-caches it in `prebuilt/`. Every run after that is instant.
+The binary isn't committed to git, so on a github install the first import fetches it from
+the matching release (synchronously, via `curl`) and caches it in `prebuilt/` — every run
+after that is instant. An npm publish bundles it, so there's nothing to fetch.
 
-Published platforms: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`.
+The import is a plain string path, so CommonJS works too:
+`Database.setCustomSQLite(require("duckdb-bun-shim"))`.
 
 ### The one DuckDB rule to know
 
