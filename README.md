@@ -1,12 +1,12 @@
-# duckdb-bun-sqlite-shim
+# duckdb-bun-shim
 
 Use **[DuckDB](https://duckdb.org/)** as the engine behind Bun's native `bun:sqlite` and
 `Bun.SQL` — by swapping the SQLite C library at runtime.
 
 ```sh
 bun:sqlite  ──┐
-              ├──►  libduckdb_sqlite_shim.dylib  ──►  DuckDB
-Bun.SQL      ──┘      (SQLite ABI, backed by DuckDB's C API)
+              ├──►  duckdb-bun-shim  ──►  DuckDB
+Bun.SQL      ──┘     (one binary: SQLite ABI + statically-linked libduckdb)
 ```
 
 Bun lets you replace its SQLite engine with `Database.setCustomSQLite(path)`. It
@@ -23,7 +23,7 @@ DuckDB's killer feature is querying files directly:
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
 
-Database.setCustomSQLite("./vendor/libduckdb_sqlite_shim.dylib");
+Database.setCustomSQLite(require("duckdb-bun-shim"));
 
 const sql = new SQL(":memory:");
 const rows = await sql`SELECT * FROM read_csv('people.csv') WHERE id = ${2}`;
@@ -36,18 +36,12 @@ API, no extra dependencies.
 
 ## Quick start
 
-Requires `cc`, `curl`, `unzip`, and [Bun](https://bun.sh).
-
 ```sh
-git clone <this repo>
-cd duckdb-bun-shim
-make            # fetches libduckdb + builds the shim into ./vendor
-bun test/sql-tagged.ts
+bun add duckdb-bun-shim
 ```
 
-`scripts/build.sh` downloads the official prebuilt `libduckdb` for your platform
-(macOS/Linux/Windows, x64/arm64) and compiles the shim against it. Override the version
-with `SHIM_DUCKDB_VERSION=v1.5.4`.
+No postinstall, no `trustedDependencies`, no build step — the shim and DuckDB are a
+single statically-linked binary shipped in the package.
 
 ## Usage
 
@@ -55,7 +49,8 @@ with `SHIM_DUCKDB_VERSION=v1.5.4`.
 import { Database } from "bun:sqlite";
 
 // MUST run before any Database is opened.
-Database.setCustomSQLite("./vendor/libduckdb_sqlite_shim.dylib");
+// require() returns the absolute path to the binary for this platform/arch.
+Database.setCustomSQLite(require("duckdb-bun-shim"));
 
 // Synchronous (bun:sqlite)
 const db = new Database(":memory:");
@@ -67,6 +62,12 @@ import { SQL } from "bun";
 const sql = new SQL(":memory:");
 await sql`SELECT * FROM read_csv('data.csv') WHERE id = ${2}`;
 ```
+
+If you install straight from git instead of npm the binary isn't committed, so the first
+`require()` fetches it from the matching GitHub release (synchronously, via `curl`) and
+caches it in `prebuilt/`. Every run after that is instant.
+
+Published platforms: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`.
 
 ### The one DuckDB rule to know
 
@@ -94,13 +95,27 @@ await sql.unsafe(`SELECT * FROM read_csv('${path}') WHERE id = ?`, [id]);
   resolves via `dlsym`, each translating to the DuckDB C API. Real translations where it
   matters (open/prepare/step/bind/column), safe no-op stubs for SQLite features with no
   DuckDB equivalent (`serialize`, `file_control`, `load_extension`).
-- **`scripts/build.sh`** — fetches `libduckdb` + `duckdb.h` from the GitHub release and
-  compiles the shim. The shim and `libduckdb` are placed in the same directory so the
-  rpath (`@loader_path` / `$ORIGIN`) resolves at runtime — keep them together when you ship.
+- **`scripts/build-static.sh`** — fetches DuckDB's static libs + `duckdb.h` and links them
+  into the shim, so the published artifact is one self-contained file with no `libduckdb`
+  next to it and no rpath to get wrong.
+- **`index.cjs`** — resolves `prebuilt/<platform>-<arch>.<ext>`, fetching it on first
+  `require()` if missing.
 
 Bun treats `sqlite3*` / `sqlite3_stmt*` as opaque pointers, so the shim owns their layout.
 `sqlite3_step` materializes the result on the first call and walks a row cursor,
 translating DuckDB's success/error into `SQLITE_ROW`/`SQLITE_DONE`.
+
+## Building from source
+
+Requires `cc`, `curl`, `unzip`, and [Bun](https://bun.sh).
+
+```sh
+bun run build:static   # → prebuilt/<platform>-<arch>.<ext>, self-contained
+make                   # dynamic build against libduckdb → ./vendor (dev loop)
+bun test
+```
+
+Override the DuckDB version with `SHIM_DUCKDB_VERSION=v1.5.4` (the current default).
 
 ## Status
 
