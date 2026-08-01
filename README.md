@@ -122,10 +122,11 @@ Override the DuckDB version with `SHIM_DUCKDB_VERSION=v1.5.4` (the current defau
 
 ## Status
 
-**Working:** scalar types (int/float/text/null/bool/blob), positional `?` params,
-`CREATE`/`INSERT`/`UPDATE`/`DELETE` with `.changes` tracking, multi-statement `db.run()`,
-file reading (CSV/Parquet/JSON), aggregates/joins/CTEs/window functions, error messages,
-both the `bun:sqlite` and `Bun.SQL` APIs.
+**Working:** scalar types (int/float/text/null/bool/blob), positional `?` and named `$x`
+params, `db.transaction()` (commit + rollback), `CREATE`/`INSERT`/`UPDATE`/`DELETE` with
+`.changes` tracking, multi-statement `db.run()`, file reading (CSV/Parquet/JSON),
+aggregates/joins/CTEs/window functions, error messages, both the `bun:sqlite` and
+`Bun.SQL` APIs.
 
 **Nested types** (STRUCT/LIST/MAP/ARRAY/UNION) come back as JSON text — `JSON.parse` them:
 
@@ -135,9 +136,11 @@ JSON.parse(db.query("SELECT {'a': 1, 'b': 'two'} AS score").get().score); // { a
 
 HUGEINT and DECIMAL come back as text too, since neither fits a JS number losslessly.
 
-**Known gaps:** named params (`$x`/`:x`/`@x`), `db.transaction()` (SQLite SAVEPOINT
-syntax), and a `?` in the SELECT list (DuckDB can't resolve result types before binding,
-so the row arrives as one `unknown` column) — see `test/audit.ts` and `test/nested.ts`.
+**Known gaps:** a nested column selected alongside a `?` *in the SELECT list*
+(`SELECT {'a': ?}`) stays empty — DuckDB can't resolve result types before binding, so
+the JSON rewrite has nothing to key off. Nested transactions collapse into the outermost
+one (DuckDB has no savepoints), so a nested failure unwinds the whole transaction. See
+`test/audit.ts`, `test/nested.ts`, `test/params-tx.ts`.
 
 **Not possible (DuckDB vs SQLite dialect):** `PRAGMA`, `sqlite_master`, `last_insert_rowid`
 (DuckDB has no rowid concept), `serialize`/`deserialize`, the `:x`/`@x` param syntaxes

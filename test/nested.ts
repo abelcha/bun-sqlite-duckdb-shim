@@ -2,8 +2,7 @@
 // re-prepares the SELECT with those columns cast (JSON for nested, VARCHAR otherwise).
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-
-Database.setCustomSQLite(import.meta.dir + "/../vendor/libduckdb_sqlite_shim.dylib");
+import "./shim";
 
 const db = new Database(":memory:");
 const one = (sql: string, ...p: any[]) => db.query(sql).get(...p) as any;

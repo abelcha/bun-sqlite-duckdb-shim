@@ -62,6 +62,7 @@ struct sqlite3 {
     char *errmsg;            // malloc'd, most recent error on this connection
     int last_changes;        // rows changed by the most recent statement
     int total_changes;       // cumulative rows changed
+    int in_tx;               // inside an explicit transaction (drives get_autocommit)
 };
 
 // A per-column slot caching the most recently fetched TEXT/BLOB value, which DuckDB
@@ -83,6 +84,7 @@ struct sqlite3_stmt {
     int nslots;
     char *sql;               // malloc'd copy of the prepared SQL (for expanded_sql)
     struct sqlite3 *db;      // owning connection, for changes bookkeeping
+    int tx;                  // +1 opens a transaction, -1 closes one, 0 neither
     // Cached parameter names (1-based). DuckDB returns them without the '$' prefix,
     // but SQLite's contract (and Bun's lookup) expects the prefix, so we prepend it.
     char **param_names;
@@ -115,7 +117,8 @@ static void slots_ensure(struct sqlite3_stmt *st)
 {
     if (st->slots)
         return;
-    int n = (int)duckdb_prepared_statement_column_count(st->prep);
+    int n = (int)(st->has_result ? duckdb_column_count(&st->result)
+                                 : duckdb_prepared_statement_column_count(st->prep));
     if (n < 1)
         n = 1;
     st->slots = calloc((size_t)n, sizeof(struct slot));
@@ -298,6 +301,43 @@ const char *sqlite3_errstr(int rc)
 
 // ---- prepare / finalize ----
 
+// Case-insensitive keyword-prefix match. A space in `kw` matches a run of blanks, and
+// the keyword must end on a word boundary, so "BEGINNER" doesn't match "BEGIN".
+static int kw_match(const char *sql, const char *kw)
+{
+    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r')
+        sql++;
+    for (; *kw; kw++, sql++) {
+        if (*kw == ' ') {
+            if (*sql != ' ' && *sql != '\t')
+                return 0;
+            while (sql[1] == ' ' || sql[1] == '\t')
+                sql++;
+            continue;
+        }
+        if ((*sql | 32) != (*kw | 32))
+            return 0;
+    }
+    return !((*sql >= 'a' && *sql <= 'z') || (*sql >= 'A' && *sql <= 'Z') ||
+             (*sql >= '0' && *sql <= '9') || *sql == '_');
+}
+
+// Bun's db.transaction() prepares SQLite's savepoint family up front (sqlite.ts:638),
+// and DuckDB has neither savepoints nor BEGIN modifiers — so without this even a plain
+// top-level transaction fails at prepare time. DuckDB has no nested transactions, so a
+// nested transaction collapses into the outermost one: its savepoint/release become
+// no-ops and its rollback unwinds everything.
+static const char *transaction_alias(const char *sql)
+{
+    if (kw_match(sql, "ROLLBACK TO"))
+        return "ROLLBACK";
+    if (kw_match(sql, "SAVEPOINT") || kw_match(sql, "RELEASE"))
+        return "SELECT 1";
+    if (kw_match(sql, "BEGIN")) // incl. DEFERRED / IMMEDIATE / EXCLUSIVE
+        return "BEGIN TRANSACTION";
+    return NULL;
+}
+
 // DuckDB's value API (the only per-row read API for a materialized result) returns an
 // empty string for nested and exotic types — STRUCT, LIST, MAP, ARRAY, UNION, ENUM, BIT,
 // BIGNUM. Rather than reimplement DuckDB's formatting in C, we make DuckDB do it: wrap
@@ -407,6 +447,15 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
     memcpy(sqlbuf, sql, (size_t)consumed);
     sqlbuf[consumed] = 0;
 
+    const char *alias = transaction_alias(sqlbuf);
+    if (alias) {
+        free(sqlbuf);
+        sqlbuf = strdup(alias);
+    }
+    int tx = kw_match(sqlbuf, "BEGIN") ? 1
+             : (kw_match(sqlbuf, "COMMIT") || kw_match(sqlbuf, "ROLLBACK")) ? -1
+                                                                            : 0;
+
     duckdb_prepared_statement prep;
     duckdb_state rc = duckdb_prepare(db->con, sqlbuf, &prep);
     if (rc == DuckDBError) {
@@ -439,6 +488,7 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
     }
 
     struct sqlite3_stmt *st = calloc(1, sizeof(struct sqlite3_stmt));
+    st->tx = tx;
     st->prep = prep;
     st->sql = sqlbuf; // keep for expanded_sql
     st->db = db;
@@ -476,6 +526,11 @@ int sqlite3_finalize(struct sqlite3_stmt *st)
         return SQLITE_OK;
     slots_clear(st);
     free(st->slots);
+    if (st->param_names) {
+        for (idx_t i = 0; i <= duckdb_nparams(st->prep); i++)
+            free(st->param_names[i]);
+        free(st->param_names);
+    }
     if (st->has_result)
         duckdb_destroy_result(&st->result);
     if (st->prep)
@@ -511,6 +566,8 @@ int sqlite3_step(struct sqlite3_stmt *s)
             return SQLITE_ERROR;
         }
         st->row_count = duckdb_row_count(&st->result);
+        if (st->tx)
+            st->db->in_tx = st->tx > 0;
 
         // Bookkeeping for sqlite3_changes/total_changes.
         idx_t changed = duckdb_rows_changed(&st->result);
@@ -556,16 +613,27 @@ int sqlite3_clear_bindings(struct sqlite3_stmt *s)
 
 // ---- column metadata (valid before stepping, via prepared-statement API) ----
 
+// Prefer the result once we have one: DuckDB can't resolve column metadata for a
+// statement with a `?` in the SELECT list until its params are bound — before that it
+// reports a single column named "unknown". Bun reads names after the first step
+// (JSSQLStatement.cpp calls initializeColumnNames once step returns a row), so it sees
+// the real ones.
 int sqlite3_column_count(struct sqlite3_stmt *s)
 {
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return st ? (int)duckdb_prepared_statement_column_count(st->prep) : 0;
+    if (!st)
+        return 0;
+    return (int)(st->has_result ? duckdb_column_count(&st->result)
+                                : duckdb_prepared_statement_column_count(st->prep));
 }
 
 const char *sqlite3_column_name(struct sqlite3_stmt *s, int N)
 {
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return st ? duckdb_prepared_statement_column_name(st->prep, (idx_t)N) : NULL;
+    if (!st)
+        return NULL;
+    return st->has_result ? duckdb_column_name(&st->result, (idx_t)N)
+                          : duckdb_prepared_statement_column_name(st->prep, (idx_t)N);
 }
 
 const char *sqlite3_column_decltype(struct sqlite3_stmt *s, int N)
@@ -711,26 +779,35 @@ int sqlite3_bind_parameter_count(struct sqlite3_stmt *s)
 }
 
 // Report NULL for purely numeric param names ("$1", "$2", ...) so Bun treats them as
-// positional `?` parameters and binds by array index; named params are returned as-is
-// (Bun strips the leading $/:/@ and looks the value up by name).
+// positional `?` parameters and binds by array index. Genuinely named ones are returned
+// SQLite-style, i.e. with the leading sigil: DuckDB reports "x", SQLite reports "$x",
+// and Bun looks the value up under the full name (it only trims the sigil in strict
+// mode). Cached per statement because SQLite's contract is "valid until finalize".
 const char *sqlite3_bind_parameter_name(struct sqlite3_stmt *s, int i)
 {
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    if (!st)
+    if (!st || i < 1)
         return NULL;
     const char *name = duckdb_parameter_name(st->prep, (idx_t)i);
-    if (!name)
+    if (!name || !*name)
         return NULL;
-    const char *p = name;
-    if (*p == '$' || *p == ':' || *p == '@')
-        p++;
-    if (*p == 0)
-        return NULL;
-    for (const char *q = p; *q; q++) {
+    for (const char *q = name; *q; q++) {
         if (*q < '0' || *q > '9')
-            return name; // genuinely named
+            goto named;
     }
     return NULL; // numeric => positional
+
+named:
+    if (!st->param_names)
+        st->param_names = calloc(duckdb_nparams(st->prep) + 1, sizeof(char *));
+    if (!st->param_names[i]) {
+        size_t n = strlen(name);
+        char *p = malloc(n + 2);
+        p[0] = '$';
+        memcpy(p + 1, name, n + 1);
+        st->param_names[i] = p;
+    }
+    return st->param_names[i];
 }
 
 int sqlite3_bind_parameter_index(struct sqlite3_stmt *s, const char *zName)
@@ -814,10 +891,10 @@ sqlite_int64 sqlite3_last_insert_rowid(struct sqlite3 *s)
 
 // ---- diagnostic / introspection ----
 
+// Drives Bun's `db.inTransaction`, which decides whether a failed transaction rolls back.
 int sqlite3_get_autocommit(struct sqlite3 *s)
 {
-    (void)s;
-    return 1; // DuckDB connections autocommit by default.
+    return s ? !s->in_tx : 1;
 }
 
 int sqlite3_stmt_readonly(struct sqlite3_stmt *s)
