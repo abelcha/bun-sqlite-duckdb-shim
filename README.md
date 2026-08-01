@@ -127,9 +127,17 @@ Override the DuckDB version with `SHIM_DUCKDB_VERSION=v1.5.4` (the current defau
 file reading (CSV/Parquet/JSON), aggregates/joins/CTEs/window functions, error messages,
 both the `bun:sqlite` and `Bun.SQL` APIs.
 
+**Nested types** (STRUCT/LIST/MAP/ARRAY/UNION) come back as JSON text — `JSON.parse` them:
+
+```ts
+JSON.parse(db.query("SELECT {'a': 1, 'b': 'two'} AS score").get().score); // { a: 1, b: "two" }
+```
+
+HUGEINT and DECIMAL come back as text too, since neither fits a JS number losslessly.
+
 **Known gaps:** named params (`$x`/`:x`/`@x`), `db.transaction()` (SQLite SAVEPOINT
-syntax), HUGEINT/DECIMAL precision, nested types (LIST/STRUCT) — see `test/audit.ts` for
-the current capability matrix. These are tracked for follow-up.
+syntax), and a `?` in the SELECT list (DuckDB can't resolve result types before binding,
+so the row arrives as one `unknown` column) — see `test/audit.ts` and `test/nested.ts`.
 
 **Not possible (DuckDB vs SQLite dialect):** `PRAGMA`, `sqlite_master`, `last_insert_rowid`
 (DuckDB has no rowid concept), `serialize`/`deserialize`, the `:x`/`@x` param syntaxes

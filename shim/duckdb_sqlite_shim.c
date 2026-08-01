@@ -298,6 +298,97 @@ const char *sqlite3_errstr(int rc)
 
 // ---- prepare / finalize ----
 
+// DuckDB's value API (the only per-row read API for a materialized result) returns an
+// empty string for nested and exotic types — STRUCT, LIST, MAP, ARRAY, UNION, ENUM, BIT,
+// BIGNUM. Rather than reimplement DuckDB's formatting in C, we make DuckDB do it: wrap
+// the SELECT in a `* REPLACE (...)` that casts those columns. 2 = JSON (parseable on the
+// JS side), 1 = VARCHAR, 0 = already readable.
+static int cast_kind(duckdb_type t)
+{
+    switch (t) {
+    case DUCKDB_TYPE_STRUCT:
+    case DUCKDB_TYPE_LIST:
+    case DUCKDB_TYPE_MAP:
+    case DUCKDB_TYPE_ARRAY:
+    case DUCKDB_TYPE_UNION:
+        return 2;
+    case DUCKDB_TYPE_ENUM:
+    case DUCKDB_TYPE_BIT:
+    case DUCKDB_TYPE_BIGNUM:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+struct buf {
+    char *p;
+    size_t len, cap;
+};
+
+static void buf_add(struct buf *b, const char *s, size_t n)
+{
+    if (b->len + n + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 256;
+        while (c < b->len + n + 1)
+            c *= 2;
+        b->p = realloc(b->p, c);
+        b->cap = c;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+
+static void buf_str(struct buf *b, const char *s) { buf_add(b, s, strlen(s)); }
+
+static void buf_ident(struct buf *b, const char *name)
+{
+    buf_str(b, "\"");
+    for (const char *c = name; *c; c++) {
+        if (*c == '"')
+            buf_str(b, "\""); // doubled inside a quoted identifier
+        buf_add(b, c, 1);
+    }
+    buf_str(b, "\"");
+}
+
+// Returns malloc'd rewritten SQL, or NULL when nothing needs casting. `json` selects the
+// target type for nested columns, so the caller can retry with VARCHAR if the JSON
+// extension isn't available in this build.
+static char *wrap_casts(duckdb_prepared_statement prep, const char *sql, int json)
+{
+    if (duckdb_prepared_statement_type(prep) != DUCKDB_STATEMENT_TYPE_SELECT)
+        return NULL; // only a SELECT can be nested in a subquery
+
+    struct buf b = {0};
+    idx_t n = duckdb_prepared_statement_column_count(prep);
+    for (idx_t i = 0; i < n; i++) {
+        int kind = cast_kind(duckdb_prepared_statement_column_type(prep, i));
+        if (!kind)
+            continue;
+        char *name = (char *)duckdb_prepared_statement_column_name(prep, i);
+        if (!name)
+            continue;
+        buf_str(&b, b.len ? ", CAST(" : "SELECT * REPLACE (CAST(");
+        buf_ident(&b, name);
+        buf_str(&b, (kind == 2 && json) ? " AS JSON) AS " : " AS VARCHAR) AS ");
+        buf_ident(&b, name);
+        duckdb_free(name);
+    }
+    if (!b.len)
+        return NULL;
+
+    size_t end = strlen(sql); // trim the trailing ';' — it can't sit inside a subquery
+    while (end && (sql[end - 1] == ';' || sql[end - 1] == '\n' || sql[end - 1] == ' ' ||
+                   sql[end - 1] == '\t' || sql[end - 1] == '\r'))
+        end--;
+    buf_str(&b, ") FROM (");
+    buf_add(&b, sql, end);
+    buf_str(&b, ")");
+    return b.p;
+}
+
 int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned int flags,
                        struct sqlite3_stmt **out, const char **pzTail)
 {
@@ -327,6 +418,24 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
         if (pzTail)
             *pzTail = sql + consumed;
         return SQLITE_ERROR;
+    }
+
+    // Re-prepare with nested/exotic columns cast to text; keep the original if the
+    // rewrite doesn't prepare (JSON extension missing, duplicate column names, ...).
+    for (int json = 1; json >= 0; json--) {
+        char *wrapped = wrap_casts(prep, sqlbuf, json);
+        if (!wrapped)
+            break;
+        duckdb_prepared_statement wprep;
+        if (duckdb_prepare(db->con, wrapped, &wprep) == DuckDBSuccess) {
+            duckdb_destroy_prepare(&prep);
+            prep = wprep;
+            free(sqlbuf);
+            sqlbuf = wrapped;
+            break;
+        }
+        duckdb_destroy_prepare(&wprep);
+        free(wrapped);
     }
 
     struct sqlite3_stmt *st = calloc(1, sizeof(struct sqlite3_stmt));
