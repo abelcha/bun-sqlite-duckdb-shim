@@ -18,12 +18,18 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pin the v2 development build used by this prerelease. Update this pair
+  # together when cutting the next alpha; do not build from a moving branch.
+  DUCKDB_SOURCE_REF: 1582849bf9e35de3fa3c330935ede5ce598e28a3
+  DUCKDB_DEV_VERSION: v2.0.0-dev1
+
 jobs:
   build:
     name: Build ${{ matrix.triple }}
     runs-on: ${{ matrix.runner }}
-    # Windows is experimental: a failure there doesn't block the npm publish of
-    # the 4 core platforms. Fix the mingw static link in a follow-up.
+    # The v2 alpha publishes the 4 Unix core platforms. Windows is deferred to
+    # a follow-up with a dedicated source-build toolchain.
     continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
@@ -32,18 +38,26 @@ jobs:
           # Both mac arches built on macos-14 (arm64). x64 is cross-compiled
           # via `clang -arch x86_64` — avoids the deprecated macos-13 Intel
           # runner, which queues indefinitely.
-          - { runner: macos-14,     triple: darwin-arm64 }
-          - { runner: macos-14,     triple: darwin-x64,   shim_triple: darwin-x64 }
+          - { runner: macos-14,     triple: darwin-arm64, duckdb_arch: arm64 }
+          - { runner: macos-14,     triple: darwin-x64,   shim_triple: darwin-x64, duckdb_arch: x86_64 }
           - { runner: ubuntu-24.04, triple: linux-x64 }
           - { runner: ubuntu-24.04-arm, triple: linux-arm64 }
-          # Windows static-libs ship as `static-libs-windows-mingw.zip`; needs
-          # msys2/setup-msys2 + gcc — not wired yet.
-          - { runner: windows-2022, triple: win32-x64, experimental: true }
+          # Windows is intentionally deferred for the v2 alpha: the preview
+          # source build needs a dedicated MSVC/MinGW configuration.
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
+
+      - name: Checkout pinned DuckDB v2 source
+        if: runner.os != 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/duckdb
+          ref: ${{ env.DUCKDB_SOURCE_REF }}
+          path: duckdb-v2
+          fetch-depth: 1
 
       # The build script auto-detects (os, arch) from the runner; SHIM_TRIPLE
       # forces the output target (cross-compile).
@@ -51,12 +65,10 @@ jobs:
         if: runner.os != 'Windows'
         env:
           SHIM_TRIPLE: ${{ matrix.shim_triple }}
-        run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
-
-      - name: Build (windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
+          SHIM_DUCKDB_SOURCE_DIR: ${{ github.workspace }}/duckdb-v2
+          DUCKDB_BUILD_DIR: ${{ runner.temp }}/duckdb-build-${{ matrix.triple }}
+          DUCKDB_CMAKE_OSX_ARCHITECTURES: ${{ matrix.duckdb_arch }}
+        run: SHIM_DUCKDB_VERSION="$DUCKDB_DEV_VERSION" bash scripts/build-static.sh
 
       - name: Smoke test (unix)
         if: runner.os != 'Windows'
@@ -71,6 +83,10 @@ jobs:
           console.log("OK:", db.query("SELECT 1+1 AS s").get());
           '
 
+      - name: DuckDB v2 compatibility tests
+        if: runner.os != 'Windows'
+        run: DUCKDB_SHIM_LIBRARY="$(find prebuilt -maxdepth 1 -type f | head -n 1)" bun run test:v2
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -82,8 +98,7 @@ jobs:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-24.04
-    # Only publish on tagged releases. `always()` so the 4 core platforms still
-    # ship when the experimental Windows leg fails (it has continue-on-error).
+    # Only publish on tagged releases, after all 4 core Unix platforms succeed.
     if: always() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4

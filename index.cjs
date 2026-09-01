@@ -23,7 +23,7 @@ const { existsSync, mkdirSync } = require("node:fs");
 const { dirname, join } = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const VERSION = "v0.1.5";
+const VERSION = "v2.0.0-alpha.1";
 const REPO = "abelcha/bun-sqlite-duckdb-shim";
 
 const ext = platform === "win32" ? "dll" : platform === "darwin" ? "dylib" : "so";

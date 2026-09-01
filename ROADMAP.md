@@ -1,9 +1,17 @@
 # Status & Roadmap
 
-Current state of the DuckDB-ABI shim, what works, what's next, and what can't be done.
+Current state of the DuckDB 2 development-line ABI shim, what works, what's next, and what can't be done.
 The test results below come from `bun test/audit.ts` — a live capability matrix.
 
 ---
+
+## DuckDB 2 development release
+
+The package version is `2.0.0-alpha.1`. The v2 C API is still evolving, so this
+shim deliberately continues to use DuckDB's SQLite-compatible C API surface while
+the v2 API stabilizes. The new `CONNECT` syntax reaches DuckDB unchanged; remote
+Quack execution additionally depends on the separately distributed Quack
+extension/service. `VARIANT` is cast to JSON text before Bun reads it.
 
 ## ✅ Working (tested)
 
@@ -97,7 +105,7 @@ These are inherent to the DuckDB-vs-SQLite gap. They will never work through the
 | Limitation | Why |
 |---|---|
 | `:name` and `@name` params | DuckDB's SQL parser rejects them at parse time |
-| Mixing named + positional in one statement | DuckDB v1.5.4 doesn't support it |
+| Mixing named + positional in one statement | DuckDB 2's SQLite-compatible parser doesn't support it |
 | `last_insert_rowid` | DuckDB has no `rowid` concept (returns `0`); use `RETURNING` |
 | `serialize()` / `deserialize()` | No DuckDB equivalent; stubbed to error |
 | `PRAGMA`, `sqlite_master`, SQLite built-in functions | Different SQL dialect |

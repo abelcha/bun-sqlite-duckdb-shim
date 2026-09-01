@@ -351,10 +351,15 @@ static int cast_kind(duckdb_type t)
     case DUCKDB_TYPE_MAP:
     case DUCKDB_TYPE_ARRAY:
     case DUCKDB_TYPE_UNION:
+    // DuckDB 2 adds VARIANT to the public type enum. Keep the numeric value
+    // here so this shim can still be compiled with a 1.x duckdb.h while the
+    // v2 build routes VARIANT through DuckDB's JSON serializer.
+    case (duckdb_type)41: // DUCKDB_TYPE_VARIANT
         return 2;
     case DUCKDB_TYPE_ENUM:
     case DUCKDB_TYPE_BIT:
     case DUCKDB_TYPE_BIGNUM:
+    case DUCKDB_TYPE_SQLNULL:
         return 1;
     default:
         return 0;
@@ -713,6 +718,11 @@ static const unsigned char *ensure_text_slot(struct sqlite3_stmt *st, int i)
         return NULL;
     slots_ensure(st);
     if (i < 0 || i >= st->nslots)
+        return NULL;
+    // DuckDB 2 may return a non-owned/empty string descriptor for NULL. Bun
+    // already asks sqlite3_column_type first, so preserve SQLite's NULL
+    // contract and never pass that descriptor through the value API.
+    if (duckdb_value_is_null(&st->result, (idx_t)i, st->row))
         return NULL;
     if (st->slots[i].ptr)
         return (const unsigned char *)st->slots[i].ptr;

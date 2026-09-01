@@ -98,9 +98,9 @@ await sql.unsafe(`SELECT * FROM read_csv('${path}') WHERE id = ?`, [id]);
   resolves via `dlsym`, each translating to the DuckDB C API. Real translations where it
   matters (open/prepare/step/bind/column), safe no-op stubs for SQLite features with no
   DuckDB equivalent (`serialize`, `file_control`, `load_extension`).
-- **`scripts/build-static.sh`** — fetches DuckDB's static libs + `duckdb.h` and links them
-  into the shim, so the published artifact is one self-contained file with no `libduckdb`
-  next to it and no rpath to get wrong.
+- **`scripts/build-static.sh`** — for this v2 line, builds the pinned DuckDB source with
+  `json`, `parquet`, and `core_functions`, then links the archives into the shim. The
+  published artifact is one self-contained file with no `libduckdb` next to it.
 - **`index.cjs`** — resolves `prebuilt/<platform>-<arch>.<ext>`, fetching it on first
   `require()` if missing.
 
@@ -110,19 +110,32 @@ translating DuckDB's success/error into `SQLITE_ROW`/`SQLITE_DONE`.
 
 ## Building from source
 
-Requires `cc`, `curl`, `unzip`, and [Bun](https://bun.sh).
+Requires `cc`, `cmake`, `ninja`, `git`, and [Bun](https://bun.sh) for the v2 source build.
 
 ```sh
-bun run build:static   # → prebuilt/<platform>-<arch>.<ext>, self-contained
+SHIM_DUCKDB_SOURCE_DIR=../duckdb bun run build:static  # → prebuilt/<platform>-<arch>.<ext>
 make                   # dynamic build against libduckdb → ./vendor (dev loop)
 bun test
 ```
 
-Override the DuckDB version with `SHIM_DUCKDB_VERSION=v1.5.4` (the current default).
+This branch is the DuckDB 2 development line: package version `2.0.0-alpha.1`,
+built from the pinned DuckDB commit recorded in `package.json`. Release CI builds
+DuckDB from source with C++17, because the v2 preview does not publish static
+library archives yet.
+
+DuckDB 2's `CONNECT` statement is passed through unchanged by the shim. The
+syntax is accepted and dispatched by DuckDB; a real Quack connection still needs
+DuckDB's Quack extension and a reachable Quack service, which are not bundled in
+this package. The v2 compatibility test also exercises the deterministic
+`ATTACH ':memory:' AS remote; CONNECT remote` engine path.
+
+For a local build, point `SHIM_DUCKDB_SOURCE_DIR` at a DuckDB v2 checkout and
+optionally set `SHIM_DUCKDB_VERSION` for the displayed engine version.
 
 ## Status
 
-**Working:** scalar types (int/float/text/null/bool/blob), positional `?` and named `$x`
+**Working:** scalar types (int/float/text/null/bool/blob), DuckDB 2 `VARIANT` as JSON,
+positional `?` and named `$x`
 params, `db.transaction()` (commit + rollback), `CREATE`/`INSERT`/`UPDATE`/`DELETE` with
 `.changes` tracking, multi-statement `db.run()`, file reading (CSV/Parquet/JSON),
 aggregates/joins/CTEs/window functions, error messages, both the `bun:sqlite` and
