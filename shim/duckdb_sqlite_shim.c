@@ -505,6 +505,12 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
     return SQLITE_OK;
 }
 
+int sqlite3_prepare_v2(struct sqlite3 *db, const char *sql, int nByte,
+                       struct sqlite3_stmt **out, const char **pzTail)
+{
+    return sqlite3_prepare_v3(db, sql, nByte, 0, out, pzTail);
+}
+
 // Bun never uses the UTF-16 prepare path, but the symbol must resolve.
 int sqlite3_prepare16_v3(struct sqlite3 *db, const void *sql, int nByte, unsigned int flags,
                          struct sqlite3_stmt **out, const void **pzTail)
@@ -892,7 +898,12 @@ int sqlite3_bind_blob(struct sqlite3_stmt *s, int i, const void *zData, int n, v
 // ---- changes / bookkeeping ----
 
 int sqlite3_changes(struct sqlite3 *s) { return s ? s->last_changes : 0; }
+sqlite_int64 sqlite3_changes64(struct sqlite3 *s) { return s ? (sqlite_int64)s->last_changes : 0; }
 int sqlite3_total_changes(struct sqlite3 *s) { return s ? s->total_changes : 0; }
+sqlite_int64 sqlite3_total_changes64(struct sqlite3 *s)
+{
+    return s ? (sqlite_int64)s->total_changes : 0;
+}
 sqlite_int64 sqlite3_last_insert_rowid(struct sqlite3 *s)
 {
     (void)s;
@@ -915,7 +926,39 @@ int sqlite3_stmt_readonly(struct sqlite3_stmt *s)
 
 int sqlite3_stmt_busy(struct sqlite3_stmt *s)
 {
+    return s ? !s->executed : 0;
+}
+
+const char *sqlite3_sql(struct sqlite3_stmt *s)
+{
+    return s ? s->sql : NULL;
+}
+
+int sqlite3_stmt_status(struct sqlite3_stmt *s, int op, int reset)
+{
     (void)s;
+    (void)op;
+    (void)reset;
+    return 0;
+}
+
+struct sqlite3 *sqlite3_db_handle(struct sqlite3_stmt *s)
+{
+    return s ? s->db : NULL;
+}
+
+int sqlite3_busy_timeout(struct sqlite3 *db, int ms)
+{
+    (void)db;
+    (void)ms;
+    return SQLITE_OK;
+}
+
+int sqlite3_limit(struct sqlite3 *db, int id, int new_limit)
+{
+    (void)db;
+    (void)id;
+    (void)new_limit;
     return 0;
 }
 

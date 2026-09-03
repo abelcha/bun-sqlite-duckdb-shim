@@ -19,10 +19,10 @@ permissions:
   contents: write
 
 env:
-  # Pin the v2 development build used by this prerelease. Update this pair
+  # Pin the exact DuckDB alpha announced on 2026-09-02. Update this pair
   # together when cutting the next alpha; do not build from a moving branch.
-  DUCKDB_SOURCE_REF: 1582849bf9e35de3fa3c330935ede5ce598e28a3
-  DUCKDB_DEV_VERSION: v2.0.0-dev1
+  DUCKDB_SOURCE_REF: 9c21294d984dfe9a1da5d055b5fce3e8a0d634b2
+  DUCKDB_ALPHA_VERSION: v2.0.0-alpha39998
 
 jobs:
   build:
@@ -68,7 +68,7 @@ jobs:
           SHIM_DUCKDB_SOURCE_DIR: ${{ github.workspace }}/duckdb-v2
           DUCKDB_BUILD_DIR: ${{ runner.temp }}/duckdb-build-${{ matrix.triple }}
           DUCKDB_CMAKE_OSX_ARCHITECTURES: ${{ matrix.duckdb_arch }}
-        run: SHIM_DUCKDB_VERSION="$DUCKDB_DEV_VERSION" bash scripts/build-static.sh
+        run: SHIM_DUCKDB_VERSION="$DUCKDB_ALPHA_VERSION" bash scripts/build-static.sh
 
       - name: Smoke test (unix)
         if: runner.os != 'Windows'

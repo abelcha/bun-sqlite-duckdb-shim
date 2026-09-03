@@ -1,4 +1,4 @@
-// DuckDB 2 development-release compatibility checks.
+// DuckDB 2 alpha compatibility checks.
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import "./shim";
@@ -6,8 +6,8 @@ import "./shim";
 const db = new Database(":memory:");
 const one = (sql: string) => db.query(sql).get() as Record<string, unknown>;
 
-test("the loaded engine is DuckDB 2", () => {
-  expect(String(one("SELECT version() AS version").version)).toMatch(/^v2\./);
+test("the loaded engine matches the published DuckDB alpha", () => {
+  expect(String(one("SELECT version() AS version").version)).toBe("v2.0.0-alpha39998");
 });
 
 test("VARIANT is materialized as JSON text", () => {

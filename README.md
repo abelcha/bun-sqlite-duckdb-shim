@@ -118,7 +118,7 @@ make                   # dynamic build against libduckdb → ./vendor (dev loop)
 bun test
 ```
 
-This branch is the DuckDB 2 development line: package version `2.0.0-alpha.1`,
+This branch is the DuckDB 2 alpha line: package version `2.0.0-alpha39998`,
 built from the pinned DuckDB commit recorded in `package.json`. Release CI builds
 DuckDB from source with C++17, because the v2 preview does not publish static
 library archives yet.

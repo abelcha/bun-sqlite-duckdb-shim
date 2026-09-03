@@ -5,9 +5,9 @@ The test results below come from `bun test/audit.ts` — a live capability matri
 
 ---
 
-## DuckDB 2 development release
+## DuckDB 2 alpha release
 
-The package version is `2.0.0-alpha.1`. The v2 C API is still evolving, so this
+The package version is `2.0.0-alpha39998`. The v2 C API is still evolving, so this
 shim deliberately continues to use DuckDB's SQLite-compatible C API surface while
 the v2 API stabilizes. The new `CONNECT` syntax reaches DuckDB unchanged; remote
 Quack execution additionally depends on the separately distributed Quack

@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER="${SHIM_DUCKDB_VERSION:-v2.0.0-dev1}"
+VER="${SHIM_DUCKDB_VERSION:-v2.0.0-alpha39998}"
 SOURCE_DIR="${SHIM_DUCKDB_SOURCE_DIR:-}"
 WORK="${WORK:-$(mktemp -d)}"
 OUTDIR="${OUTDIR:-prebuilt}"
@@ -58,6 +58,7 @@ if [ -n "$SOURCE_DIR" ]; then
      [ ! -f "$BUILD_DIR/extension/core_functions/libcore_functions_extension.a" ]; then
     echo ">> configuring DuckDB source ($VER) -> $BUILD_DIR"
     CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF
+                "-DDUCKDB_EXPLICIT_VERSION=$VER"
                 '-DBUILD_EXTENSIONS=parquet;json'
                 -DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER=)
     if [ -n "${DUCKDB_CMAKE_OSX_ARCHITECTURES:-}" ]; then
