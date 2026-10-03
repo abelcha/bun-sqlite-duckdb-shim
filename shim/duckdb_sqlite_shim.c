@@ -879,6 +879,18 @@ int sqlite3_bind_blob(struct sqlite3_stmt *s, int i, const void *zData, int n, v
     return duckdb_bind_blob(st->prep, (idx_t)i, zData, (idx_t)n) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
 }
 
+// Bun >= 1.4.3 binds strings/blobs through the *64 variants.
+int sqlite3_bind_text64(struct sqlite3_stmt *s, int i, const char *zData, sqlite_uint64 n, void (*xDel)(void *), unsigned char enc)
+{
+    (void)enc;
+    return sqlite3_bind_text(s, i, zData, (int)n, xDel);
+}
+
+int sqlite3_bind_blob64(struct sqlite3_stmt *s, int i, const void *zData, sqlite_uint64 n, void (*xDel)(void *))
+{
+    return sqlite3_bind_blob(s, i, zData, (int)n, xDel);
+}
+
 // ---- changes / bookkeeping ----
 
 int sqlite3_changes(struct sqlite3 *s) { return s ? s->last_changes : 0; }
