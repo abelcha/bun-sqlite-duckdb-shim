@@ -59,7 +59,8 @@ jobs:
         run: SHIM_DUCKDB_VERSION=v1.5.4 bash scripts/build-static.sh
 
       - name: Smoke test (unix)
-        if: runner.os != 'Windows'
+        # A cross-compiled binary (darwin-x64 on arm64) can't load in the runner's own bun.
+        if: runner.os != 'Windows' && !matrix.shim_triple
         run: |
           bun -e '
           const { Database } = require("bun:sqlite");
