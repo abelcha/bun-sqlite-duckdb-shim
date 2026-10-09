@@ -30,7 +30,9 @@
 
 #include "duckdb.h"
 
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +43,7 @@ typedef uint64_t sqlite_uint64;
 // ---- SQLite result codes (only the ones we surface) ----
 #define SQLITE_OK         0
 #define SQLITE_ERROR      1   // generic error
+#define SQLITE_RANGE      25  // bind index out of range
 #define SQLITE_ROW        100
 #define SQLITE_DONE       101
 
@@ -63,6 +66,8 @@ struct sqlite3 {
     int last_changes;        // rows changed by the most recent statement
     int total_changes;       // cumulative rows changed
     int in_tx;               // inside an explicit transaction (drives get_autocommit)
+    int nstmt;               // live statements; the handle outlives close() until they drain
+    int closing;             // close() was called while statements were still live
 };
 
 // A per-column slot caching the most recently fetched TEXT/BLOB value, which DuckDB
@@ -71,6 +76,11 @@ struct sqlite3 {
 struct slot {
     void *ptr;
     idx_t size;
+};
+
+// A placeholder occurrence in the SQL text.
+struct pref {
+    int start, end, idx;
 };
 
 struct sqlite3_stmt {
@@ -85,10 +95,18 @@ struct sqlite3_stmt {
     char *sql;               // malloc'd copy of the prepared SQL (for expanded_sql)
     struct sqlite3 *db;      // owning connection, for changes bookkeeping
     int tx;                  // +1 opens a transaction, -1 closes one, 0 neither
-    // Cached parameter names (1-based). DuckDB returns them without the '$' prefix,
-    // but SQLite's contract (and Bun's lookup) expects the prefix, so we prepend it.
-    char **param_names;
+    // Parameters are never bound in DuckDB: we scan the placeholders ourselves, keep
+    // each bound value as an escaped SQL literal, and substitute them into the SQL
+    // right before duckdb_prepare. Parameter positions (table, ORDER BY, ...) are then
+    // unrestricted. Only set when the SQL has placeholders; otherwise `prep` is
+    // prepared up front.
+    int nparam;
+    struct pref *refs;       // placeholder occurrences in `sql`
+    int nrefs;
+    char **pnames;           // 1-based; "$name" or NULL for positional (owned)
+    char **vals;             // 1-based SQL literals, NULL = unbound => NULL (owned)
 };
+
 
 // ---- helpers ----
 
@@ -178,6 +196,106 @@ static int find_stmt_end(const char *sql, int n)
     return n;
 }
 
+// Offset of the first token in `sql`, skipping whitespace and comments.
+static int skip_blank(const char *sql, int n)
+{
+    int i = 0;
+    while (i < n) {
+        char c = sql[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            i++;
+        } else if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+            while (i < n && sql[i] != '\n')
+                i++;
+        } else if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(sql[i] == '*' && i + 1 < n && sql[i + 1] == '/'))
+                i++;
+            i = i + 2 < n ? i + 2 : n;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
+static int is_word(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Locate `?`, `?NNN`, `$NNN` and `$name` placeholders outside quotes/comments/$$-strings.
+// Numbers are positional (no name); `?` takes the next free index; a repeated `$name`
+// reuses its index.
+static void scan_params(struct sqlite3_stmt *st, const char *sql, int n)
+{
+    char quote = 0;
+    for (int i = 0; i < n; i++) {
+        char c = sql[i];
+        if (quote) {
+            if (c == quote) {
+                if (i + 1 < n && sql[i + 1] == quote)
+                    i++;
+                else
+                    quote = 0;
+            }
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            quote = c;
+        } else if ((c == '-' && i + 1 < n && sql[i + 1] == '-') ||
+                   (c == '/' && i + 1 < n && sql[i + 1] == '*')) {
+            int e = i + skip_blank(sql + i, n - i);
+            i = (e > i ? e : i + 1) - 1;
+        } else if ((c == '?' || c == '$') && !(i && is_word(sql[i - 1]))) {
+            int j = i + 1, idx = 0, named = 0;
+            while (j < n && is_word(sql[j]))
+                j++;
+            if (c == '$' && j < n && sql[j] == '$') { // dollar-quoted string: skip it
+                int tl = j - i + 1;
+                for (j++; j + tl <= n && memcmp(sql + j, sql + i, (size_t)tl); j++)
+                    ;
+                i = j + tl - 1;
+                continue;
+            }
+            if (c == '$' && j == i + 1)
+                continue;
+            int digits = 1;
+            for (int k = i + 1; k < j; k++)
+                digits &= sql[k] >= '0' && sql[k] <= '9';
+            if (j > i + 1 && digits)
+                idx = atoi(sql + i + 1);
+            else if (c == '?')
+                idx = st->nparam + 1, j = i + 1;
+            else
+                named = 1;
+            if (named) {
+                for (int k = 1; k <= st->nparam && !idx; k++)
+                    if (st->pnames[k] && strlen(st->pnames[k]) == (size_t)(j - i) &&
+                        !memcmp(st->pnames[k], sql + i, (size_t)(j - i)))
+                        idx = k;
+            }
+            if (!idx)
+                idx = st->nparam + 1;
+            if (idx > st->nparam) {
+                st->pnames = realloc(st->pnames, ((size_t)idx + 1) * sizeof(char *));
+                st->vals = realloc(st->vals, ((size_t)idx + 1) * sizeof(char *));
+                for (int k = st->nparam + 1; k <= idx; k++)
+                    st->pnames[k] = st->vals[k] = NULL;
+                st->nparam = idx;
+            }
+            if (named && !st->pnames[idx]) {
+                st->pnames[idx] = malloc((size_t)(j - i) + 1);
+                memcpy(st->pnames[idx], sql + i, (size_t)(j - i));
+                st->pnames[idx][j - i] = 0;
+            }
+            st->refs = realloc(st->refs, ((size_t)st->nrefs + 1) * sizeof(struct pref));
+            st->refs[st->nrefs++] = (struct pref){i, j, idx};
+            i = j - 1;
+        }
+    }
+}
+
 // Transcode little-endian UTF-16 (JSC's in-memory representation on macOS) to a
 // NUL-terminated UTF-8 malloc'd buffer. `n_bytes` is in bytes; returns bytes written
 // (excluding NUL) via out_len.
@@ -260,6 +378,12 @@ static int close_common(struct sqlite3 *s)
 {
     if (!s)
         return SQLITE_OK;
+    // Bun closes at exit / close(false) while statements are alive and finalizes them
+    // later: defer the real teardown to the last finalize (sqlite3_close_v2 semantics).
+    if (s->nstmt > 0) {
+        s->closing = 1;
+        return SQLITE_OK;
+    }
     if (s->con)
         duckdb_disconnect(&s->con);
     if (s->db)
@@ -340,7 +464,7 @@ static const char *transaction_alias(const char *sql)
 
 // DuckDB's value API (the only per-row read API for a materialized result) returns an
 // empty string for nested and exotic types — STRUCT, LIST, MAP, ARRAY, UNION, ENUM, BIT,
-// BIGNUM. Rather than reimplement DuckDB's formatting in C, we make DuckDB do it: wrap
+// BIGNUM, UUID, TIMESTAMP_TZ/S/MS/NS, TIME_TZ. Rather than reimplement DuckDB's formatting in C, we make DuckDB do it: wrap
 // the SELECT in a `* REPLACE (...)` that casts those columns. 2 = JSON (parseable on the
 // JS side), 1 = VARCHAR, 0 = already readable.
 static int cast_kind(duckdb_type t)
@@ -360,6 +484,13 @@ static int cast_kind(duckdb_type t)
     case DUCKDB_TYPE_BIT:
     case DUCKDB_TYPE_BIGNUM:
     case DUCKDB_TYPE_SQLNULL:
+    // The value API also yields "" (NULL data) for these:
+    case DUCKDB_TYPE_UUID:
+    case DUCKDB_TYPE_TIMESTAMP_TZ:
+    case DUCKDB_TYPE_TIME_TZ:
+    case DUCKDB_TYPE_TIMESTAMP_S:
+    case DUCKDB_TYPE_TIMESTAMP_MS:
+    case DUCKDB_TYPE_TIMESTAMP_NS:
         return 1;
     default:
         return 0;
@@ -434,6 +565,69 @@ static char *wrap_casts(duckdb_prepared_statement prep, const char *sql, int jso
     return b.p;
 }
 
+// Prepare `sql` (owned, freed on failure) and return the final text in *final: with
+// nested/exotic columns cast to text when needed. `quiet` skips recording the error.
+static int prepare_sql(struct sqlite3 *db, char *sql, duckdb_prepared_statement *out, char **final,
+                       int quiet)
+{
+    duckdb_prepared_statement prep;
+    if (duckdb_prepare(db->con, sql, &prep) == DuckDBError) {
+        const char *e = duckdb_prepare_error(prep);
+        if (!quiet)
+            set_err(db, e ? e : "prepare failed");
+        duckdb_destroy_prepare(&prep);
+        free(sql);
+        return SQLITE_ERROR;
+    }
+
+    // Re-prepare with nested/exotic columns cast to text; keep the original if the
+    // rewrite doesn't prepare (JSON extension missing, duplicate column names, ...).
+    for (int json = 1; json >= 0; json--) {
+        char *wrapped = wrap_casts(prep, sql, json);
+        if (!wrapped)
+            break;
+        duckdb_prepared_statement wprep;
+        if (duckdb_prepare(db->con, wrapped, &wprep) == DuckDBSuccess) {
+            duckdb_destroy_prepare(&prep);
+            prep = wprep;
+            free(sql);
+            sql = wrapped;
+            break;
+        }
+        duckdb_destroy_prepare(&wprep);
+        free(wrapped);
+    }
+    *out = prep;
+    *final = sql;
+    return SQLITE_OK;
+}
+
+// Copy of st->sql with every placeholder replaced by its bound literal (NULL if unbound).
+static char *expand_sql(struct sqlite3_stmt *st)
+{
+    struct buf b = {0};
+    int at = 0;
+    for (int r = 0; r < st->nrefs; r++) {
+        buf_add(&b, st->sql + at, (size_t)(st->refs[r].start - at));
+        buf_str(&b, st->vals[st->refs[r].idx] ? st->vals[st->refs[r].idx] : "NULL");
+        at = st->refs[r].end;
+    }
+    buf_str(&b, st->sql + at);
+    return b.p;
+}
+
+// Deferred statements prepare lazily, with the current bindings inlined.
+static int ensure_prep(struct sqlite3_stmt *st, int quiet)
+{
+    if (st->prep)
+        return SQLITE_OK;
+    char *final;
+    int rc = prepare_sql(st->db, expand_sql(st), &st->prep, &final, quiet);
+    if (rc == SQLITE_OK)
+        free(final);
+    return rc;
+}
+
 int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned int flags,
                        struct sqlite3_stmt **out, const char **pzTail)
 {
@@ -444,6 +638,15 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
         return SQLITE_ERROR;
 
     int len = nByte < 0 ? (int)strlen(sql) : nByte;
+
+    // Like SQLite: no tokens (blank, comments, lone ';') => OK with a NULL statement.
+    int first = skip_blank(sql, len);
+    if (first >= len || sql[first] == ';') {
+        if (pzTail)
+            *pzTail = sql + (first < len ? first + 1 : len);
+        return SQLITE_OK;
+    }
+
     int consumed = find_stmt_end(sql, len);
 
     char *sqlbuf = malloc((size_t)consumed + 1);
@@ -461,42 +664,20 @@ int sqlite3_prepare_v3(struct sqlite3 *db, const char *sql, int nByte, unsigned 
              : (kw_match(sqlbuf, "COMMIT") || kw_match(sqlbuf, "ROLLBACK")) ? -1
                                                                             : 0;
 
-    duckdb_prepared_statement prep;
-    duckdb_state rc = duckdb_prepare(db->con, sqlbuf, &prep);
-    if (rc == DuckDBError) {
-        const char *e = duckdb_prepare_error(prep);
-        set_err(db, e ? e : "prepare failed");
-        duckdb_destroy_prepare(&prep);
-        free(sqlbuf);
+    struct sqlite3_stmt *st = calloc(1, sizeof(struct sqlite3_stmt));
+    scan_params(st, sqlbuf, (int)strlen(sqlbuf));
+    if (st->nparam) {
+        st->sql = sqlbuf; // template; prepared at first use
+    } else if (prepare_sql(db, sqlbuf, &st->prep, &st->sql, 0) != SQLITE_OK) {
+        free(st);
         // Even on failure, report the tail so a multi-statement run() can advance.
         if (pzTail)
             *pzTail = sql + consumed;
         return SQLITE_ERROR;
     }
-
-    // Re-prepare with nested/exotic columns cast to text; keep the original if the
-    // rewrite doesn't prepare (JSON extension missing, duplicate column names, ...).
-    for (int json = 1; json >= 0; json--) {
-        char *wrapped = wrap_casts(prep, sqlbuf, json);
-        if (!wrapped)
-            break;
-        duckdb_prepared_statement wprep;
-        if (duckdb_prepare(db->con, wrapped, &wprep) == DuckDBSuccess) {
-            duckdb_destroy_prepare(&prep);
-            prep = wprep;
-            free(sqlbuf);
-            sqlbuf = wrapped;
-            break;
-        }
-        duckdb_destroy_prepare(&wprep);
-        free(wrapped);
-    }
-
-    struct sqlite3_stmt *st = calloc(1, sizeof(struct sqlite3_stmt));
     st->tx = tx;
-    st->prep = prep;
-    st->sql = sqlbuf; // keep for expanded_sql
     st->db = db;
+    db->nstmt++;
 
     if (out)
         *out = st;
@@ -537,17 +718,22 @@ int sqlite3_finalize(struct sqlite3_stmt *st)
         return SQLITE_OK;
     slots_clear(st);
     free(st->slots);
-    if (st->param_names) {
-        for (idx_t i = 0; i <= duckdb_nparams(st->prep); i++)
-            free(st->param_names[i]);
-        free(st->param_names);
+    for (int i = 1; i <= st->nparam; i++) {
+        free(st->pnames[i]);
+        free(st->vals[i]);
     }
+    free(st->pnames);
+    free(st->vals);
+    free(st->refs);
     if (st->has_result)
         duckdb_destroy_result(&st->result);
     if (st->prep)
         duckdb_destroy_prepare(&st->prep);
     free(st->sql);
+    struct sqlite3 *db = st->db;
     free(st);
+    if (--db->nstmt == 0 && db->closing)
+        close_common(db);
     return SQLITE_OK;
 }
 
@@ -568,6 +754,8 @@ int sqlite3_step(struct sqlite3_stmt *s)
         }
         st->row = 0;
 
+        if (ensure_prep(st, 0) != SQLITE_OK)
+            return SQLITE_ERROR;
         duckdb_state rc = duckdb_execute_prepared(st->prep, &st->result);
         st->executed = 1;
         st->has_result = 1;
@@ -617,8 +805,14 @@ int sqlite3_reset(struct sqlite3_stmt *s)
 int sqlite3_clear_bindings(struct sqlite3_stmt *s)
 {
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    if (st)
-        duckdb_clear_bindings(st->prep);
+    if (!st)
+        return SQLITE_OK;
+    for (int i = 1; i <= st->nparam; i++) {
+        free(st->vals[i]);
+        st->vals[i] = NULL;
+    }
+    if (st->nparam && st->prep)
+        duckdb_destroy_prepare(&st->prep);
     return SQLITE_OK;
 }
 
@@ -634,6 +828,9 @@ int sqlite3_column_count(struct sqlite3_stmt *s)
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
     if (!st)
         return 0;
+    // Deferred statements know their columns only once prepared with real values.
+    if (!st->has_result && ensure_prep(st, 1) != SQLITE_OK)
+        return 0;
     return (int)(st->has_result ? duckdb_column_count(&st->result)
                                 : duckdb_prepared_statement_column_count(st->prep));
 }
@@ -641,7 +838,7 @@ int sqlite3_column_count(struct sqlite3_stmt *s)
 const char *sqlite3_column_name(struct sqlite3_stmt *s, int N)
 {
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    if (!st)
+    if (!st || (!st->has_result && !st->prep))
         return NULL;
     return st->has_result ? duckdb_column_name(&st->result, (idx_t)N)
                           : duckdb_prepared_statement_column_name(st->prep, (idx_t)N);
@@ -733,6 +930,8 @@ static const unsigned char *ensure_text_slot(struct sqlite3_stmt *st, int i)
     if (st->slots[i].ptr)
         return (const unsigned char *)st->slots[i].ptr;
     duckdb_string str = duckdb_value_string(&st->result, (idx_t)i, st->row);
+    if (!str.data) // unstringifiable type: a non-NULL TEXT must never be a NULL pointer
+        return (const unsigned char *)"";
     st->slots[i].ptr = str.data;
     st->slots[i].size = str.size;
     return (const unsigned char *)str.data;
@@ -790,109 +989,124 @@ int sqlite3_column_bytes16(struct sqlite3_stmt *s, int i)
 
 int sqlite3_bind_parameter_count(struct sqlite3_stmt *s)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return st ? (int)duckdb_nparams(st->prep) : 0;
+    return s ? s->nparam : 0;
 }
 
-// Report NULL for purely numeric param names ("$1", "$2", ...) so Bun treats them as
-// positional `?` parameters and binds by array index. Genuinely named ones are returned
-// SQLite-style, i.e. with the leading sigil: DuckDB reports "x", SQLite reports "$x",
-// and Bun looks the value up under the full name (it only trims the sigil in strict
-// mode). Cached per statement because SQLite's contract is "valid until finalize".
+// NULL for positional parameters (`?`, `?N`, `$N`) so Bun binds them by array index.
+// Named ones come back SQLite-style with their sigil ("$x"); Bun looks the value up under
+// the full name (it only trims the sigil in strict mode).
 const char *sqlite3_bind_parameter_name(struct sqlite3_stmt *s, int i)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    if (!st || i < 1)
-        return NULL;
-    const char *name = duckdb_parameter_name(st->prep, (idx_t)i);
-    if (!name || !*name)
-        return NULL;
-    for (const char *q = name; *q; q++) {
-        if (*q < '0' || *q > '9')
-            goto named;
-    }
-    return NULL; // numeric => positional
-
-named:
-    if (!st->param_names)
-        st->param_names = calloc(duckdb_nparams(st->prep) + 1, sizeof(char *));
-    if (!st->param_names[i]) {
-        size_t n = strlen(name);
-        char *p = malloc(n + 2);
-        p[0] = '$';
-        memcpy(p + 1, name, n + 1);
-        st->param_names[i] = p;
-    }
-    return st->param_names[i];
+    return (s && i >= 1 && i <= s->nparam) ? s->pnames[i] : NULL;
 }
 
 int sqlite3_bind_parameter_index(struct sqlite3_stmt *s, const char *zName)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    if (!st || !zName)
+    if (!s || !zName)
         return 0;
-    idx_t idx = 0;
-    if (duckdb_bind_parameter_index(st->prep, &idx, zName) == DuckDBSuccess)
-        return (int)idx;
+    for (int i = 1; i <= s->nparam; i++)
+        if (s->pnames[i] && (!strcmp(s->pnames[i], zName) || !strcmp(s->pnames[i] + 1, zName)))
+            return i;
     return 0;
+}
+
+// Takes ownership of `lit`. A changed value invalidates the prepared statement.
+static int set_val(struct sqlite3_stmt *s, int i, char *lit)
+{
+    if (!s || i < 1 || i > s->nparam || !lit) {
+        free(lit);
+        return SQLITE_RANGE;
+    }
+    if (strcmp(s->vals[i] ? s->vals[i] : "NULL", lit) && s->prep)
+        duckdb_destroy_prepare(&s->prep);
+    free(s->vals[i]);
+    s->vals[i] = lit;
+    return SQLITE_OK;
+}
+
+static char *fmt(const char *f, ...)
+{
+    char tmp[64];
+    va_list ap;
+    va_start(ap, f);
+    vsnprintf(tmp, sizeof tmp, f, ap);
+    va_end(ap);
+    return strdup(tmp);
 }
 
 int sqlite3_bind_int(struct sqlite3_stmt *s, int i, int v)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return duckdb_bind_int32(st->prep, (idx_t)i, v) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    return set_val(s, i, fmt(v < 0 ? "(%d)" : "%d", v)); // parens: "1-?" must not become "1--5"
 }
 
 int sqlite3_bind_int64(struct sqlite3_stmt *s, int i, sqlite_int64 v)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return duckdb_bind_int64(st->prep, (idx_t)i, (int64_t)v) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    return set_val(s, i, fmt(v < 0 ? "(%lld)" : "%lld", (long long)v));
 }
 
+// Typed so a whole-valued double stays DOUBLE (a bare 1.5 would be DECIMAL).
 int sqlite3_bind_double(struct sqlite3_stmt *s, int i, double v)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return duckdb_bind_double(st->prep, (idx_t)i, v) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    if (v != v)
+        return set_val(s, i, strdup("'nan'::DOUBLE"));
+    if (v - v != 0) // +-inf
+        return set_val(s, i, strdup(v < 0 ? "'-inf'::DOUBLE" : "'inf'::DOUBLE"));
+    return set_val(s, i, fmt("(%.17g::DOUBLE)", v));
 }
 
 int sqlite3_bind_null(struct sqlite3_stmt *s, int i)
 {
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return duckdb_bind_null(st->prep, (idx_t)i) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    return set_val(s, i, strdup("NULL"));
+}
+
+// Single-quoted literal; embedded quotes doubled. (DuckDB has no backslash escapes.)
+static char *quote_text(const char *p, size_t n)
+{
+    struct buf b = {0};
+    buf_str(&b, "'");
+    for (size_t k = 0; k < n; k++) {
+        if (p[k] == '\'')
+            buf_str(&b, "'");
+        buf_add(&b, p + k, 1);
+    }
+    buf_str(&b, "'");
+    return b.p;
 }
 
 int sqlite3_bind_text(struct sqlite3_stmt *s, int i, const char *zData, int n, void (*xDel)(void *))
 {
-    (void)xDel; // DuckDB copies; SQLITE_TRANSIENT is ignored.
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    int len = n < 0 ? (int)strlen(zData) : n;
-    char *buf = malloc((size_t)len + 1);
-    if (!buf)
-        return SQLITE_ERROR;
-    memcpy(buf, zData, (size_t)len);
-    buf[len] = 0;
-    duckdb_state rc = duckdb_bind_varchar(st->prep, (idx_t)i, buf);
-    free(buf);
-    return rc == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    (void)xDel; // we copy; SQLITE_TRANSIENT is ignored.
+    if (!zData)
+        return sqlite3_bind_null(s, i);
+    return set_val(s, i, quote_text(zData, (size_t)(n < 0 ? (int)strlen(zData) : n)));
 }
 
 int sqlite3_bind_text16(struct sqlite3_stmt *s, int i, const void *zData, int n, void (*xDel)(void *))
 {
     (void)xDel;
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    char *u8 = utf16le_to_utf8(zData, n, NULL);
+    size_t len = 0;
+    char *u8 = utf16le_to_utf8(zData, n, &len);
     if (!u8)
         return SQLITE_ERROR;
-    duckdb_state rc = duckdb_bind_varchar(st->prep, (idx_t)i, u8);
+    int rc = set_val(s, i, quote_text(u8, len));
     free(u8);
-    return rc == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    return rc;
 }
 
 int sqlite3_bind_blob(struct sqlite3_stmt *s, int i, const void *zData, int n, void (*xDel)(void *))
 {
     (void)xDel;
-    struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
-    return duckdb_bind_blob(st->prep, (idx_t)i, zData, (idx_t)n) == DuckDBSuccess ? SQLITE_OK : SQLITE_ERROR;
+    if (!zData)
+        return sqlite3_bind_null(s, i);
+    struct buf b = {0};
+    buf_str(&b, "'");
+    for (int k = 0; k < n; k++) {
+        char h[5];
+        snprintf(h, sizeof h, "\\x%02X", ((const unsigned char *)zData)[k]);
+        buf_str(&b, h);
+    }
+    buf_str(&b, "'::BLOB");
+    return set_val(s, i, b.p);
 }
 
 // Bun >= 1.4.3 binds strings/blobs through the *64 variants.
@@ -980,7 +1194,7 @@ char *sqlite3_expanded_sql(struct sqlite3_stmt *s)
     struct sqlite3_stmt *st = (struct sqlite3_stmt *)s;
     if (!st || !st->sql)
         return NULL;
-    return strdup(st->sql);
+    return st->nparam ? expand_sql(st) : strdup(st->sql);
 }
 
 // ---- memory ----
@@ -1010,6 +1224,21 @@ int sqlite3_db_config(struct sqlite3 *db, int op, ...)
 {
     (void)db;
     (void)op;
+    return SQLITE_OK;
+}
+
+// Bun calls this unconditionally on every open connection at process exit (it isn't
+// resolved-or-skipped like the node:sqlite extras), so a missing symbol is a NULL call:
+// that was the segfault after every test run. DuckDB checkpoints on its own.
+int sqlite3_wal_checkpoint_v2(struct sqlite3 *db, const char *zDb, int eMode, int *pnLog, int *pnCkpt)
+{
+    (void)db;
+    (void)zDb;
+    (void)eMode;
+    if (pnLog)
+        *pnLog = 0;
+    if (pnCkpt)
+        *pnCkpt = 0;
     return SQLITE_OK;
 }
 

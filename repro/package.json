@@ -1,0 +1,17 @@
+{
+  "name": "reflow",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.6-r.1",
+    "apache-arrow": "^21.2.0",
+    "duckdb-bun-shim": "abelcha/bun-sqlite-duckdb-shim"
+  }
+}

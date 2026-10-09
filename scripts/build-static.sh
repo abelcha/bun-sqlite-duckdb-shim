@@ -117,6 +117,17 @@ case "$TRIPLE" in
   *)                 TARGET_ARCH="$(uname -m)" ;;
 esac
 
+# Export ONLY the sqlite3_* ABI. Statically linked DuckDB is C++ with thousands of
+# weak/vague-linkage symbols (typeinfo, vtables, inline statics); exported, they get
+# coalesced by the dynamic loader with a second DuckDB in the process (e.g.
+# @duckdb/node-api) and each copy ends up running the other's objects -> segfault.
+EXPORTS="$WORK/exports.txt"
+if [ "$EXT" = "dylib" ]; then
+  echo "_sqlite3_*" > "$EXPORTS"
+else
+  printf '{ global: sqlite3_*; local: *; };\n' > "$EXPORTS"
+fi
+
 if [ "$EXT" = "dylib" ]; then
   # macOS: clang -arch cross-compiles x86_64 on an arm64 host natively.
   cc -arch "$TARGET_ARCH" -shared -O2 -fPIC -Wall \
@@ -125,6 +136,7 @@ if [ "$EXT" = "dylib" ]; then
      $LIBS \
      -lc++ -framework CoreFoundation -framework Security \
      -Wl,-install_name,@rpath/duckdb-bun-shim.dylib \
+     -Wl,-exported_symbols_list,"$EXPORTS" \
      -Wl,-dead_strip
 elif [ "$EXT" = "so" ]; then
   cc -shared -O2 -fPIC -Wall \
@@ -132,6 +144,7 @@ elif [ "$EXT" = "so" ]; then
      -o "$OUT" shim/duckdb_sqlite_shim.c \
      $LIBS \
      -static-libstdc++ -lpthread -ldl -lm \
+     -Wl,--version-script="$EXPORTS" -Wl,--exclude-libs,ALL \
      -Wl,--gc-sections -ffunction-sections -fdata-sections
 else
   # Windows (mingw)

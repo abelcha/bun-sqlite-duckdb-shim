@@ -1,0 +1,86 @@
+name: Release macOS arm64
+
+# Temporary DuckDB 2 alpha release path. This repairs the existing
+# v2.0.0-alpha39998 release with the only currently supported platform.
+# The regular release workflow remains responsible for the full matrix later.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag whose GitHub release should receive the binary
+        required: true
+        default: v2.0.0-alpha39998
+
+permissions:
+  contents: write
+
+env:
+  DUCKDB_SOURCE_REF: 9c21294d984dfe9a1da5d055b5fce3e8a0d634b2
+  DUCKDB_ALPHA_VERSION: v2.0.0-alpha39998
+
+jobs:
+  build:
+    name: Build darwin-arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Checkout pinned DuckDB v2 source
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/duckdb
+          ref: ${{ env.DUCKDB_SOURCE_REF }}
+          path: duckdb-v2
+          fetch-depth: 1
+
+      - name: Build macOS arm64 shim
+        env:
+          SHIM_TRIPLE: darwin-arm64
+          SHIM_DUCKDB_SOURCE_DIR: ${{ github.workspace }}/duckdb-v2
+          DUCKDB_BUILD_DIR: ${{ runner.temp }}/duckdb-build-alpha39998-arm64
+          DUCKDB_CMAKE_OSX_ARCHITECTURES: arm64
+        run: SHIM_DUCKDB_VERSION="$DUCKDB_ALPHA_VERSION" bash scripts/build-static.sh
+
+      - name: Smoke test
+        run: |
+          bun -e '
+          const { Database } = require("bun:sqlite");
+          Database.setCustomSQLite("prebuilt/darwin-arm64.dylib");
+          const db = new Database(":memory:");
+          console.log(db.query("SELECT version() AS version").get());
+          '
+
+      - name: DuckDB v2 compatibility tests
+        env:
+          DUCKDB_SHIM_LIBRARY: ${{ github.workspace }}/prebuilt/darwin-arm64.dylib
+        run: bun run test:v2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-darwin-arm64
+          path: prebuilt/darwin-arm64.dylib
+          if-no-files-found: error
+
+  release:
+    name: Attach macOS arm64 binary
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-darwin-arm64
+          path: prebuilt
+
+      - name: Verify artifact
+        run: test -f prebuilt/darwin-arm64.dylib
+
+      - name: Attach binary to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: prebuilt/darwin-arm64.dylib
+          fail_on_unmatched_files: true

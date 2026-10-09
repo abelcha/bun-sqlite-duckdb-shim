@@ -22,8 +22,8 @@
   ],
   "scripts": {
     "build:static": "bash scripts/build-static.sh",
-    "test": "bun test ./test/nested.ts ./test/params-tx.ts ./test/v2-compat.ts",
-    "test:legacy": "bun test ./test/nested.ts ./test/params-tx.ts",
+    "test": "bun test ./test/nested.ts ./test/params-tx.ts ./test/regressions.ts ./test/v2-compat.ts",
+    "test:legacy": "bun test ./test/nested.ts ./test/params-tx.ts ./test/regressions.ts",
     "test:v2": "bun test ./test/v2-compat.ts",
     "prepublishOnly": "node -e \"const f=require('node:fs'),p='darwin-arm64.dylib darwin-x64.dylib linux-x64.so linux-arm64.so'.split(' ');for(const b of p){if(!f.existsSync('prebuilt/'+b)){console.error('MISSING prebuilt/'+b+' — run CI build first');process.exit(1)}}console.log('core prebuilt binaries present')\""
   }
