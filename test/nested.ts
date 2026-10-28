@@ -42,8 +42,8 @@ test("scalar columns keep their JS types alongside a struct", () => {
   expect(r.bo).toBe(1);
   expect(r.nul).toBe(null);
   expect(JSON.parse(r.st)).toEqual({ a: 1 });
-  // DECIMAL/HUGEINT stay text on purpose — they don't fit a JS number losslessly.
-  expect(one("SELECT 1.5 AS d, SUM(v) AS h FROM (SELECT UNNEST([1,2,3]) AS v)")).toEqual({ d: "1.5", h: "6" });
+  // DECIMAL/HUGEINT are numbers (text only past int64)
+  expect(one("SELECT 1.5 AS d, SUM(v) AS h FROM (SELECT UNNEST([1,2,3]) AS v)")).toEqual({ d: 1.5, h: 6 });
 });
 
 test("struct from a table, filtered", () => {

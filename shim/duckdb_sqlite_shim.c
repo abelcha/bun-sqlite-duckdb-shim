@@ -29,6 +29,17 @@
 //   - last_insert_rowid is always 0 (DuckDB has no rowid concept).
 
 #include "duckdb.h"
+#ifdef DUCKDB_STATIC_BUILD
+#include "duckdb_static_extension.h"
+// DuckDB 2 static builds only see the extensions registered before the first open.
+// loadable_extensions + httplib are what make INSTALL / LOAD (core and community) work.
+int32_t duckdb_extension_core_functions_describe(duckdb_extension_descriptor *);
+int32_t duckdb_extension_json_describe(duckdb_extension_descriptor *);
+int32_t duckdb_extension_parquet_describe(duckdb_extension_descriptor *);
+int32_t duckdb_extension_icu_describe(duckdb_extension_descriptor *);
+int32_t duckdb_extension_httplib_describe(duckdb_extension_descriptor *);
+int32_t duckdb_extension_loadable_extensions_describe(duckdb_extension_descriptor *);
+#endif
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -88,6 +99,7 @@ struct sqlite3_stmt {
     duckdb_result result;
     int has_result;          // result holds a live query result
     int executed;            // first step has run duckdb_execute_prepared
+    int runs;                // SQLITE_STMTSTATUS_RUN: Bun checks it to keep iterate() cursors valid
     idx_t row;               // current row cursor (0-based)
     idx_t row_count;
     struct slot *slots;
@@ -342,7 +354,6 @@ static char *utf16le_to_utf8(const void *data, int n_bytes, size_t *out_len)
 
 int sqlite3_open_v2(const char *filename, struct sqlite3 **out, int flags, const char *zVfs)
 {
-    (void)flags;
     (void)zVfs;
     if (out)
         *out = NULL;
@@ -351,9 +362,29 @@ int sqlite3_open_v2(const char *filename, struct sqlite3 **out, int flags, const
     const char *path =
         (!filename || filename[0] == 0 || strcmp(filename, ":memory:") == 0) ? NULL : filename;
 
+#ifdef DUCKDB_STATIC_BUILD
+    // registering the same describe function again is a no-op
+    duckdb_register_static_extension(duckdb_extension_core_functions_describe);
+    duckdb_register_static_extension(duckdb_extension_json_describe);
+    duckdb_register_static_extension(duckdb_extension_parquet_describe);
+    duckdb_register_static_extension(duckdb_extension_icu_describe);
+    duckdb_register_static_extension(duckdb_extension_httplib_describe);
+    duckdb_register_static_extension(duckdb_extension_loadable_extensions_describe);
+#endif
+
+    // SQLITE_OPEN_READONLY (0x1); DuckDB has no read-only in-memory database
+    duckdb_config cfg = NULL;
+    if ((flags & 0x1) && path) {
+        duckdb_create_config(&cfg);
+        duckdb_set_config(cfg, "access_mode", "READ_ONLY");
+    }
+
     duckdb_database db;
     char *err = NULL;
-    if (duckdb_open_ext(path, &db, NULL, &err) == DuckDBError) {
+    duckdb_state opened = duckdb_open_ext(path, &db, cfg, &err);
+    if (cfg)
+        duckdb_destroy_config(&cfg);
+    if (opened == DuckDBError) {
         // Don't leak DuckDB's error message.
         if (err)
             duckdb_free(err);
@@ -758,6 +789,7 @@ int sqlite3_step(struct sqlite3_stmt *s)
             return SQLITE_ERROR;
         duckdb_state rc = duckdb_execute_prepared(st->prep, &st->result);
         st->executed = 1;
+        st->runs++;
         st->has_result = 1;
         if (rc == DuckDBError) {
             const char *e = duckdb_result_error(&st->result);
@@ -844,11 +876,43 @@ const char *sqlite3_column_name(struct sqlite3_stmt *s, int N)
                           : duckdb_prepared_statement_column_name(st->prep, (idx_t)N);
 }
 
+// Bun's `declaredTypes`. Nested columns were cast to JSON (see cast_kind), so they read
+// "JSON"; the exotic ones cast to VARCHAR read "VARCHAR".
 const char *sqlite3_column_decltype(struct sqlite3_stmt *s, int N)
 {
-    (void)s;
-    (void)N;
-    return NULL; // not surfaced; Bun tolerates NULL
+    if (!s || ensure_prep(s, 1) != SQLITE_OK)
+        return NULL;
+    duckdb_logical_type lt = duckdb_prepared_statement_column_logical_type(s->prep, (idx_t)N);
+    char *alias = duckdb_logical_type_get_alias(lt);
+    duckdb_type t = duckdb_get_type_id(lt);
+    duckdb_destroy_logical_type(&lt);
+    int json = alias && !strcmp(alias, "JSON");
+    duckdb_free(alias);
+    if (json)
+        return "JSON";
+    switch (t) {
+    case DUCKDB_TYPE_BOOLEAN: return "BOOLEAN";
+    case DUCKDB_TYPE_TINYINT: return "TINYINT";
+    case DUCKDB_TYPE_SMALLINT: return "SMALLINT";
+    case DUCKDB_TYPE_INTEGER: return "INTEGER";
+    case DUCKDB_TYPE_BIGINT: return "BIGINT";
+    case DUCKDB_TYPE_UTINYINT: return "UTINYINT";
+    case DUCKDB_TYPE_USMALLINT: return "USMALLINT";
+    case DUCKDB_TYPE_UINTEGER: return "UINTEGER";
+    case DUCKDB_TYPE_UBIGINT: return "UBIGINT";
+    case DUCKDB_TYPE_HUGEINT: return "HUGEINT";
+    case DUCKDB_TYPE_UHUGEINT: return "UHUGEINT";
+    case DUCKDB_TYPE_FLOAT: return "FLOAT";
+    case DUCKDB_TYPE_DOUBLE: return "DOUBLE";
+    case DUCKDB_TYPE_DECIMAL: return "DECIMAL";
+    case DUCKDB_TYPE_DATE: return "DATE";
+    case DUCKDB_TYPE_TIME: return "TIME";
+    case DUCKDB_TYPE_TIMESTAMP: return "TIMESTAMP";
+    case DUCKDB_TYPE_INTERVAL: return "INTERVAL";
+    case DUCKDB_TYPE_BLOB: return "BLOB";
+    case DUCKDB_TYPE_VARCHAR: return "VARCHAR";
+    default: return NULL;
+    }
 }
 
 // ---- column values (result-based, valid after step) ----
@@ -870,18 +934,24 @@ int sqlite3_column_type(struct sqlite3_stmt *s, int i)
     case DUCKDB_TYPE_UTINYINT:
     case DUCKDB_TYPE_USMALLINT:
     case DUCKDB_TYPE_UINTEGER:
-    case DUCKDB_TYPE_UBIGINT:
         return SQLITE_INTEGER;
+    case DUCKDB_TYPE_UBIGINT:
+    case DUCKDB_TYPE_HUGEINT:
+    case DUCKDB_TYPE_UHUGEINT: {
+        // a number when it fits int64 (e.g. sum() is HUGEINT), else exact digits as text
+        double d = duckdb_value_double(&st->result, (idx_t)i, st->row);
+        return d >= -9223372036854775808.0 && d < 9223372036854775808.0 ? SQLITE_INTEGER : SQLITE_TEXT;
+    }
     case DUCKDB_TYPE_FLOAT:
     case DUCKDB_TYPE_DOUBLE:
+    case DUCKDB_TYPE_DECIMAL: // a number, fractional digits past double precision are lost
         return SQLITE_FLOAT;
     case DUCKDB_TYPE_BLOB:
         return SQLITE_BLOB;
     default:
         // Everything else is fetched as text via duckdb_value_string, which auto-casts.
-        // This includes VARCHAR, timestamps, DECIMAL, HUGEINT, LIST, STRUCT, UUID, etc.
-        // Routing HUGEINT/DECIMAL/LIST/STRUCT through TEXT prevents silent truncation
-        // (HUGEINT overflows int64; complex types return empty if not stringified).
+        // This includes VARCHAR, timestamps, LIST, STRUCT, UUID, etc.
+        // (complex types return empty if not stringified).
         return SQLITE_TEXT;
     }
 }
@@ -1112,8 +1182,9 @@ int sqlite3_bind_blob(struct sqlite3_stmt *s, int i, const void *zData, int n, v
 // Bun >= 1.4.3 binds strings/blobs through the *64 variants.
 int sqlite3_bind_text64(struct sqlite3_stmt *s, int i, const char *zData, sqlite_uint64 n, void (*xDel)(void *), unsigned char enc)
 {
-    (void)enc;
-    return sqlite3_bind_text(s, i, zData, (int)n, xDel);
+    // Bun sends non-Latin-1 strings as UTF-16 here (enc != SQLITE_UTF8 = 1).
+    return enc == 1 ? sqlite3_bind_text(s, i, zData, (int)n, xDel)
+                    : sqlite3_bind_text16(s, i, zData, (int)n, xDel);
 }
 
 int sqlite3_bind_blob64(struct sqlite3_stmt *s, int i, const void *zData, sqlite_uint64 n, void (*xDel)(void *))
@@ -1146,13 +1217,15 @@ int sqlite3_get_autocommit(struct sqlite3 *s)
 
 int sqlite3_stmt_readonly(struct sqlite3_stmt *s)
 {
-    (void)s;
-    return 0; // treat all as writable so Bun's changes-tracking path runs.
+    // Bun's `columnTypes` needs it; anything else stays writable for changes tracking
+    return s && ensure_prep(s, 1) == SQLITE_OK &&
+           duckdb_prepared_statement_type(s->prep) == DUCKDB_STATEMENT_TYPE_SELECT;
 }
 
 int sqlite3_stmt_busy(struct sqlite3_stmt *s)
 {
-    return s ? !s->executed : 0;
+    // like SQLite: stepped at least once, not yet done or reset
+    return s ? s->executed && s->row < s->row_count : 0;
 }
 
 const char *sqlite3_sql(struct sqlite3_stmt *s)
@@ -1162,10 +1235,8 @@ const char *sqlite3_sql(struct sqlite3_stmt *s)
 
 int sqlite3_stmt_status(struct sqlite3_stmt *s, int op, int reset)
 {
-    (void)s;
-    (void)op;
     (void)reset;
-    return 0;
+    return s && op == 6 /* SQLITE_STMTSTATUS_RUN */ ? s->runs : 0;
 }
 
 struct sqlite3 *sqlite3_db_handle(struct sqlite3_stmt *s)

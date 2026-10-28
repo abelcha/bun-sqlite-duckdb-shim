@@ -1,16 +1,16 @@
 {
   "name": "duckdb-bun-shim",
-  "version": "2.0.0-alpha39998",
-  "description": "DuckDB 2 alpha release: use DuckDB 2 as the engine behind Bun's native bun:sqlite / Bun.SQL via a static SQLite-ABI shim.",
+  "version": "2.0.0",
+  "description": "Use DuckDB 2 as the engine behind Bun's native bun:sqlite / Bun.SQL via a static SQLite-ABI shim.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/abelcha/bun-sqlite-duckdb-shim.git"
   },
   "duckdb": {
-    "version": "v2.0.0-alpha39998",
+    "version": "v2.0.0",
     "source": "duckdb/duckdb",
-    "commit": "9c21294d984dfe9a1da5d055b5fce3e8a0d634b2"
+    "commit": "d54cbbe3df17e8e5ce68312f483b4155836112aa"
   },
   "main": "index.cjs",
   "types": "index.d.ts",
