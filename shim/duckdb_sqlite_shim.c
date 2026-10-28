@@ -100,6 +100,7 @@ struct sqlite3_stmt {
     int has_result;          // result holds a live query result
     int executed;            // first step has run duckdb_execute_prepared
     int runs;                // SQLITE_STMTSTATUS_RUN: Bun checks it to keep iterate() cursors valid
+    unsigned shape;          // hash of the columns last reported to Bun, see sqlite3_stmt_readonly
     idx_t row;               // current row cursor (0-based)
     idx_t row_count;
     struct slot *slots;
@@ -850,6 +851,23 @@ int sqlite3_clear_bindings(struct sqlite3_stmt *s)
 
 // ---- column metadata (valid before stepping, via prepared-statement API) ----
 
+// FNV-1a over the column names (of the result, else of the prepared statement).
+static unsigned shape_of(struct sqlite3_stmt *st)
+{
+    unsigned h = 2166136261u;
+    idx_t n = st->has_result ? duckdb_column_count(&st->result)
+                             : duckdb_prepared_statement_column_count(st->prep);
+    for (idx_t i = 0; i < n; i++) {
+        char *owned = st->has_result ? NULL : (char *)duckdb_prepared_statement_column_name(st->prep, i);
+        const char *name = st->has_result ? duckdb_column_name(&st->result, i) : owned;
+        for (const char *c = name ? name : ""; *c; c++)
+            h = (h ^ (unsigned char)*c) * 16777619u;
+        h = (h ^ 0xffu) * 16777619u; // separator
+        duckdb_free(owned);
+    }
+    return h;
+}
+
 // Prefer the result once we have one: DuckDB can't resolve column metadata for a
 // statement with a `?` in the SELECT list until its params are bound — before that it
 // reports a single column named "unknown". Bun reads names after the first step
@@ -862,7 +880,8 @@ int sqlite3_column_count(struct sqlite3_stmt *s)
         return 0;
     // Deferred statements know their columns only once prepared with real values.
     if (!st->has_result && ensure_prep(st, 1) != SQLITE_OK)
-        return 0;
+        return st->shape = 0;
+    st->shape = shape_of(st);
     return (int)(st->has_result ? duckdb_column_count(&st->result)
                                 : duckdb_prepared_statement_column_count(st->prep));
 }
@@ -1217,9 +1236,12 @@ int sqlite3_get_autocommit(struct sqlite3 *s)
 
 int sqlite3_stmt_readonly(struct sqlite3_stmt *s)
 {
-    // Bun's `columnTypes` needs it; anything else stays writable for changes tracking
+    // Bun's `columnTypes` needs it; anything else stays writable for changes tracking.
+    // Bun re-reads column names only after a writable statement ran, so a deferred
+    // statement whose columns changed with its bindings (or that failed with none) says so.
     return s && ensure_prep(s, 1) == SQLITE_OK &&
-           duckdb_prepared_statement_type(s->prep) == DUCKDB_STATEMENT_TYPE_SELECT;
+           duckdb_prepared_statement_type(s->prep) == DUCKDB_STATEMENT_TYPE_SELECT &&
+           !(s->has_result && shape_of(s) != s->shape);
 }
 
 int sqlite3_stmt_busy(struct sqlite3_stmt *s)

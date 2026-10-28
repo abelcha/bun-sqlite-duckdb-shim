@@ -87,3 +87,23 @@ test("closing with live statements does not crash", () => {
   q.get();
   d.close();
 });
+
+test("a statement that failed its first run still reads rows after", () => {
+  db.run("create table late (x int); insert into late values (1)");
+  for (const read of ["get", "all", "values"] as const) {
+    const q = db.query("select * from query_table(?)");
+    expect(() => q[read]("nope")).toThrow();
+    expect(q[read]("late")).toEqual(read === "get" ? { x: 1 } : read === "all" ? [{ x: 1 }] : [[1]]);
+  }
+  const q = db.query("select * from query_table(?)");
+  expect(() => [...q.iterate("nope")]).toThrow();
+  expect([...q.iterate("late")]).toEqual([{ x: 1 }]);
+});
+
+test("columns follow the bindings", () => {
+  db.run("create table c1 as select 1 a; create table c2 as select 2 b, 3 c");
+  const q = db.query("select * from query_table(?)");
+  expect(q.get("c1")).toEqual({ a: 1 });
+  expect(q.get("c2")).toEqual({ b: 2, c: 3 });
+  expect(q.all("c1")).toEqual([{ a: 1 }]);
+});
