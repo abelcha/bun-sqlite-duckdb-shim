@@ -60,7 +60,7 @@ else
   printf '{ global: sqlite3_*; local: *; };\n' > "$EXPORTS"
   cc -shared -O2 -fPIC -Wall -DDUCKDB_STATIC_BUILD -I"$LIBS" \
      -o "$OUT" shim/duckdb_sqlite_shim.c $ARCHIVES \
-     -static-libstdc++ -lpthread -ldl -lm \
+     -lstdc++ -lpthread -ldl -lm \
      -Wl,--version-script="$EXPORTS" -Wl,--exclude-libs,ALL \
      -Wl,--gc-sections -ffunction-sections -fdata-sections
 fi
